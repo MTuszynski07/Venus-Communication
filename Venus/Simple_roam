@@ -1,0 +1,99 @@
+#include "libpynq.h"
+#include "stepper.h"
+#include "motion.h"
+#include <buttons.h>
+#include <stdio.h>
+#include <unistd.h>
+
+#define Full_turn 600
+#define Forward_step 1000
+#define Standard_speed 30000, 30000
+#define Left90 (-Full_turn), (Full_turn)
+#define Right90 (Full_turn), (-Full_turn)
+#define Forward (Forward_step), (Forward_step)
+/**
+ * Perform roaming cycle with motion interrupt handling
+ * Handles position correction if motion is interrupted by sensor applications
+ */
+void roaming_cycle(void) {
+    printf("Starting forward motion...\n");
+    int forward_result = motion_forward(Forward_step, Standard_speed);
+
+    if (forward_result == 1) {
+        printf("Forward motion interrupted by sensor!\n");
+        int16_t steps_left, steps_right;
+        motion_get_current_steps(&steps_left, &steps_right);
+        printf("Completed steps: L=%d R=%d\n", steps_left, steps_right);
+
+        // For forward motion, just stop - no position correction needed
+        printf("Forward motion stopped. Robot remains at current position.\n");
+        sleep(1);
+        return;
+    }
+
+    printf("Starting sweep motion...\n");
+    int sweep_result = motion_sweep(Full_turn, Standard_speed);
+
+    if (sweep_result == 1) {
+        printf("Sweep motion interrupted by sensor!\n");
+        int16_t steps_left, steps_right;
+        motion_get_current_steps(&steps_left, &steps_right);
+        printf("Completed steps: L=%d R=%d\n", steps_left, steps_right);
+
+        // Calculate reverse steps to return to original orientation
+        // Since sweep is 4 phases, we need to reverse the current phase
+        int16_t reverse_left = -steps_left + (Full_turn * 4);
+        int16_t reverse_right = -steps_right + (Full_turn * 4);
+
+        printf("Correcting orientation with reverse steps: L=%d R=%d\n", reverse_left, reverse_right);
+        motion_correct_position(reverse_left, reverse_right, Standard_speed);
+        sleep(1);
+        return;
+    }
+
+    printf("Roaming cycle completed successfully.\n");
+}
+
+int main(void) {
+    setbuf(stdout, NULL);
+    
+    pynq_init();
+    stepper_init();
+    buttons_init();
+    motion_init();
+    
+    stepper_enable();
+    stepper_set_speed(Standard_speed);
+    
+    printf("Roaming Switch Application Started\n");
+    printf("This application orchestrates motion and handles sensor interrupts.\n");
+    printf("Button 0: Start roaming cycle\n");
+    printf("Button 1: Exit\n\n");
+    
+    while(1){
+        while(1){
+            // Break out of the loop and start roaming if button 0 is pushed
+            if (wait_until_any_button_pushed() == 0) {
+                sleep(3);
+                break;
+            }
+            // Destroy everything and exit if button 1 is pushed
+            if (wait_until_any_button_pushed() == 1) {
+                stepper_disable();
+                buttons_destroy();
+                stepper_destroy();
+                pynq_destroy();
+                return 0;
+            }
+        }
+        
+        // Execute roaming cycle (which handles interrupts from sensors)
+        roaming_cycle();
+    }
+    
+    stepper_disable();
+    buttons_destroy();
+    stepper_destroy();
+    pynq_destroy();
+    return 0;
+}

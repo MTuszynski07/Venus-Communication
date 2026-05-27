@@ -1,0 +1,283 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/time.h>
+
+#include <libpynq.h>
+#include "vl53l0x.h"
+#include "motion.h"
+
+/* ================= I2C MUX ================= */
+
+#define TCA_ADDR 0x70
+
+#define CH_DIST1 0
+#define CH_DIST2 2
+#define CH_TEMP  4
+
+#define MLX90614_ADDR 0x5A
+#define MLX90614_REG_OBJECT 0x07
+
+/* ================= ULTRASONIC ================= */
+
+#define PIN_TRIG IO_AR13
+#define PIN_ECHO IO_AR12
+
+#define US_SAMPLES 3
+
+/* ================= IR SENSORS ================= */
+
+#define IR_1 IO_AR0
+#define IR_2 IO_AR1
+#define IR_3 IO_AR2
+#define IR_4 IO_AR3
+
+/* ================= THRESHOLDS ================= */
+
+#define FRONT_LIMIT_MM   300
+#define SIDE_LIMIT_MM    200
+#define US_LIMIT_CM       20.0f
+#define TEMP_LIMIT_C      45.0f
+
+/* ================= THREAD CONTROL ================= */
+
+static bool sensor_enabled = false;
+static pthread_t sensor_thread;
+
+/* ================= VL53 INSTANCES ================= */
+
+static vl53x dist1;
+static vl53x dist2;
+
+/* ================= TIME HELPERS ================= */
+
+static long long now_us(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000000LL + tv.tv_usec;
+}
+
+static void delay_us(long long us) {
+    long long start = now_us();
+    while (now_us() - start < us);
+}
+
+/* ================= GPIO HELPERS ================= */
+
+static void pin_write(io_t pin, int val) {
+    gpio_set_level(pin, val ? GPIO_LEVEL_HIGH : GPIO_LEVEL_LOW);
+}
+
+static int pin_read(io_t pin) {
+    return gpio_get_level(pin);
+}
+
+/* ================= I2C MUX ================= */
+
+static int tca_select(uint8_t ch) {
+    if (ch > 7) return 1;
+    uint8_t data = 1 << ch;
+    return iic_write_register(IIC0, TCA_ADDR, 0x00, &data, 1);
+}
+
+/* ================= MLX90614 ================= */
+
+static bool mlx_read(float *temp_c) {
+    uint8_t buf[2];
+
+    if (iic_read_register(IIC0, MLX90614_ADDR, MLX90614_REG_OBJECT, buf, 2)) {
+        return true;
+    }
+
+    uint16_t raw = ((uint16_t)buf[1] << 8) | buf[0];
+    *temp_c = raw * 0.02f - 273.15f;
+
+    return false;
+}
+
+/* ================= ULTRASONIC ================= */
+
+static float ultrasonic_once(void) {
+
+    pin_write(PIN_TRIG, 0);
+    delay_us(5);
+
+    pin_write(PIN_TRIG, 1);
+    delay_us(10);
+    pin_write(PIN_TRIG, 0);
+
+    long long start = now_us();
+
+    while (!pin_read(PIN_ECHO)) {
+        if (now_us() - start > 30000)
+            return -1;
+    }
+
+    long long echo_start = now_us();
+
+    while (pin_read(PIN_ECHO)) {
+        if (now_us() - echo_start > 30000)
+            return -2;
+    }
+
+    long long echo_end = now_us();
+
+    return (echo_end - echo_start) / 58.0f;
+}
+
+static float ultrasonic_filtered(void) {
+
+    float v[US_SAMPLES];
+    int n = 0;
+
+    for (int i = 0; i < US_SAMPLES; i++) {
+
+        float d = ultrasonic_once();
+
+        if (d > 2 && d < 400)
+            v[n++] = d;
+
+        sleep_msec(20);
+    }
+
+    if (n == 0) return -1;
+
+    for (int i = 0; i < n - 1; i++)
+        for (int j = 0; j < n - 1 - i; j++)
+            if (v[j] > v[j + 1]) {
+                float t = v[j];
+                v[j] = v[j + 1];
+                v[j + 1] = t;
+            }
+
+    return v[n / 2];
+}
+
+/* ================= SENSOR THREAD ================= */
+
+static void* sensor_thread_fn(void *arg) {
+
+    printf("Sensor thread started\n");
+
+    while (sensor_enabled) {
+
+        /* ---------- VL53 #1 ---------- */
+        tca_select(CH_DIST1);
+        sleep_msec(5);
+        int d1 = tofReadDistance(&dist1);
+
+        /* ---------- VL53 #2 ---------- */
+        tca_select(CH_DIST2);
+        sleep_msec(5);
+        int d2 = tofReadDistance(&dist2);
+
+        /* ---------- TEMP ---------- */
+        float temp = -999;
+        tca_select(CH_TEMP);
+        sleep_msec(5);
+        mlx_read(&temp);
+
+        /* ---------- ULTRASONIC ---------- */
+        float us = ultrasonic_filtered();
+
+        /* ---------- IR ---------- */
+        int ir1 = pin_read(IR_1);
+        int ir2 = pin_read(IR_2);
+        int ir3 = pin_read(IR_3);
+        int ir4 = pin_read(IR_4);
+
+        bool line_detected = (!ir1 || !ir2 || !ir3 || !ir4);
+
+        printf("D1=%d D2=%d US=%.1f T=%.1f IR=%d%d%d%d\n",
+               d1, d2, us, temp, ir1, ir2, ir3, ir4);
+
+        motion_state_t state = motion_get_state();
+
+        bool active =
+            (state == MOTION_FORWARD ||
+             state == MOTION_SWEEP);
+
+        if (active) {
+
+            if (d1 > 0 && d1 < FRONT_LIMIT_MM) {
+                motion_request_interrupt_source(TRIGGER_DISTANCE);
+                sleep_msec(300);
+            }
+
+            if (d2 > 0 && d2 < SIDE_LIMIT_MM) {
+                motion_request_interrupt_source(TRIGGER_DISTANCE);
+                sleep_msec(300);
+            }
+
+            if (us > 0 && us < US_LIMIT_CM) {
+                motion_request_interrupt_source(TRIGGER_DISTANCE);
+                sleep_msec(300);
+            }
+
+            if (line_detected) {
+                motion_request_interrupt_source(TRIGGER_LINE);
+                sleep_msec(300);
+            }
+
+            if (temp > TEMP_LIMIT_C) {
+                motion_request_interrupt_source(TRIGGER_TEMP);
+                sleep_msec(300);
+            }
+        }
+
+        sleep_msec(100);
+    }
+
+    return NULL;
+}
+
+/* ================= MAIN ================= */
+
+int main(void) {
+
+    setbuf(stdout, NULL);
+
+    pynq_init();
+    motion_init();
+
+    /* ---------- I2C ---------- */
+    switchbox_set_pin(IO_AR_SCL, SWB_IIC0_SCL);
+    switchbox_set_pin(IO_AR_SDA, SWB_IIC0_SDA);
+    iic_init(IIC0);
+
+    /* ---------- GPIO ---------- */
+    gpio_set_direction(PIN_TRIG, GPIO_DIR_OUTPUT);
+    gpio_set_direction(PIN_ECHO, GPIO_DIR_INPUT);
+
+    gpio_set_direction(IR_1, GPIO_DIR_INPUT);
+    gpio_set_direction(IR_2, GPIO_DIR_INPUT);
+    gpio_set_direction(IR_3, GPIO_DIR_INPUT);
+    gpio_set_direction(IR_4, GPIO_DIR_INPUT);
+
+    /* ---------- VL53 ---------- */
+    tca_select(CH_DIST1);
+    tofInit(&dist1, IIC0, 0x29, 0);
+
+    tca_select(CH_DIST2);
+    tofInit(&dist2, IIC0, 0x29, 0);
+
+    printf("Sensors initialized\n");
+
+    sensor_enabled = true;
+    pthread_create(&sensor_thread, NULL, sensor_thread_fn, NULL);
+
+    while (1) {
+        sleep_msec(1000);
+    }
+
+    sensor_enabled = false;
+    pthread_join(sensor_thread, NULL);
+
+    iic_destroy(IIC0);
+    pynq_destroy();
+
+    return 0;
+}
