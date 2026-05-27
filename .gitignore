@@ -5,6 +5,3 @@ __pycache__/
 .Python
 *.egg-info/
 .env
-*.o
-*.d
-mqttcomm/main
